@@ -11,8 +11,19 @@ jobs:
       - name: Get latest Studio version
         shell: pwsh
         run: |
-          $guid = (Invoke-RestMethod "https://setup.rbxcdn.com/versionStudio").ToString().Trim()
-          Write-Host "Latest Studio version: $guid"
+          $info = $null
+          foreach ($u in @(
+            "https://clientsettingscdn.roblox.com/v2/client-version/WindowsStudio64",
+            "https://clientsettings.roblox.com/v2/client-version/WindowsStudio64"
+          )) {
+            try { $info = Invoke-RestMethod $u; break }
+            catch { Write-Host "Failed: $u  ($($_.Exception.Message))" }
+          }
+          if (-not $info) { throw "Could not get Studio version from client settings" }
+          Write-Host ($info | ConvertTo-Json)
+          $guid = $info.clientVersionUpload
+          if (-not $guid) { throw "No clientVersionUpload in response" }
+          Write-Host "Latest Studio64 version: $guid"
           "STUDIO_GUID=$guid" >> $env:GITHUB_ENV
 
       - name: Download and assemble Studio from the CDN
@@ -21,12 +32,30 @@ jobs:
           $ErrorActionPreference = "Stop"
           $ProgressPreference = "SilentlyContinue"
           $guid = $env:STUDIO_GUID
-          $base = "https://setup.rbxcdn.com"
+          $mirrors = @(
+            "https://setup.rbxcdn.com",
+            "https://setup-cfly.rbxcdn.com",
+            "https://s3.amazonaws.com/setup.roblox.com"
+          )
           $verDir = Join-Path $env:LOCALAPPDATA "Roblox\Versions\$guid"
           $tmp = Join-Path $env:RUNNER_TEMP "pkgs"
           New-Item -ItemType Directory -Force $verDir, $tmp | Out-Null
 
-          # 1) Known folders (from Vinegar's Studio map)
+          function Get-File($file, $out) {
+            foreach ($m in $mirrors) {
+              try {
+                Invoke-WebRequest -UseBasicParsing "$m/$guid-$file" -OutFile $out
+                return $true
+              } catch {
+                $msg = ($_.Exception.Message -replace '\s+', ' ')
+                if ($msg.Length -gt 140) { $msg = $msg.Substring(0, 140) }
+                Write-Host "  $m failed for $file : $msg"
+              }
+            }
+            return $false
+          }
+
+          # 1) Built-in folders (fallback)
           $map = @{
             "BuiltInPlugins.zip"="BuiltInPlugins"
             "ApplicationConfig.zip"="ApplicationConfig"
@@ -62,30 +91,20 @@ jobs:
             "WebView2RuntimeInstaller.zip"=""
           }
 
-          # 2) Fill gaps from the Mod Manager's live KnownRoots.json (never overrides step 1)
-          $script:added = @()
-          function Walk($o) {
-            if ($o -is [System.Management.Automation.PSCustomObject]) {
-              foreach ($p in $o.PSObject.Properties) {
-                if ($p.Name -like "*.zip" -and $p.Value -is [string]) {
-                  if (-not $map.ContainsKey($p.Name)) { $map[$p.Name] = $p.Value; $script:added += $p.Name }
-                } else { Walk $p.Value }
-              }
-            } elseif ($o -is [System.Collections.IEnumerable] -and $o -isnot [string]) {
-              foreach ($x in $o) { Walk $x }
-            }
-          }
+          # 2) Live map from the Studio Mod Manager (overrides built-in)
           try {
             $rootsUrl = "https://raw.githubusercontent.com/MaximumADHD/Roblox-Studio-Mod-Manager/main/Config/KnownRoots.json"
             Invoke-WebRequest -UseBasicParsing $rootsUrl -OutFile "$tmp\KnownRoots.json"
-            $raw = Get-Content "$tmp\KnownRoots.json" -Raw
-            Write-Host "KnownRoots.json starts with:"
-            Write-Host $raw.Substring(0, [Math]::Min(1200, $raw.Length))
-            Walk ($raw | ConvertFrom-Json)
-            Write-Host "Added from remote map: $($script:added -join ', ')"
+            $roots = Get-Content "$tmp\KnownRoots.json" -Raw | ConvertFrom-Json
+            $count = 0
+            foreach ($p in $roots.PSObject.Properties) {
+              $to = $p.Value.ExtractTo
+              if ($null -ne $to) { $map["$($p.Name).zip"] = [string]$to; $count++ }
+            }
+            Write-Host "Loaded $count entries from remote KnownRoots.json"
           } catch { Write-Host "::warning::Could not use remote KnownRoots.json: $($_.Exception.Message)" }
 
-          # 3) Last resort: guesses from naming pattern (flagged in the log)
+          # 3) Last resort guesses for packages nobody has mapped (flagged in the log)
           $guess = @{
             "RibbonConfig.zip"="RibbonConfig"
             "content-platform-dictionaries.zip"="PlatformContent/pc/dictionaries"
@@ -97,13 +116,16 @@ jobs:
             if (-not $map.ContainsKey($k)) { $map[$k] = $guess[$k]; $guessed += $k }
           }
 
-          # 4) Download, verify, extract
-          Invoke-WebRequest -UseBasicParsing "$base/$guid-rbxPkgManifest.txt" -OutFile "$tmp\manifest.txt"
+          # 4) Manifest
+          if (-not (Get-File "rbxPkgManifest.txt" "$tmp\manifest.txt")) {
+            throw "Package manifest not found for $guid on any mirror"
+          }
           $lines = @(Get-Content "$tmp\manifest.txt" | Where-Object { $_.Trim() -ne "" })
           if ($lines[0] -match '^v\d+$') { $lines = $lines[1..($lines.Count - 1)] }
           $total = [int]($lines.Count / 4)
           Write-Host "Packages in manifest: $total"
 
+          # 5) Download, verify, extract
           $unmapped = @()
           for ($i = 0; $i -lt $lines.Count; $i += 4) {
             $name = $lines[$i].Trim()
@@ -113,11 +135,12 @@ jobs:
 
             $ok = $false
             for ($try = 1; $try -le 3 -and -not $ok; $try++) {
-              Invoke-WebRequest -UseBasicParsing "$base/$guid-$name" -OutFile $zip
-              $ok = ((Get-FileHash $zip -Algorithm MD5).Hash -ieq $md5)
-              if (-not $ok) { Write-Host "  checksum mismatch on $name, retry $try" }
+              if (Get-File $name $zip) {
+                $ok = ((Get-FileHash $zip -Algorithm MD5).Hash -ieq $md5)
+                if (-not $ok) { Write-Host "  checksum mismatch on $name, retry $try" }
+              }
             }
-            if (-not $ok) { throw "Bad checksum: $name" }
+            if (-not $ok) { throw "Could not download a valid copy of $name" }
 
             if ($map.ContainsKey($name)) {
               $dest = Join-Path $verDir $map[$name]
